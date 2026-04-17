@@ -663,5 +663,6 @@ self.alert_cooldown_seconds = 60        # 报警冷却时间
 
 **文档版本：** v2.0  
 **更新日期：** 2026年4月18日  
-**作者：** AHhh  
+**作者：** AHhh & ZY  
+**测试：** CYX & JYX  
 **扩展自：** https://github.com/wn6078/fire_dection
