@@ -424,4 +424,6 @@ using (var client = new HttpClient())
 ---
 
 **文档版本：** v2.0  
-**更新日期：** 2024年
+**更新日期：** 2026年4月18日  
+**作者：** AHhh  
+**扩展自：** https://github.com/wn6078/fire_dection
