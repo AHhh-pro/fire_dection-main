@@ -20,6 +20,10 @@ import time
 # 导入自定义工具函数
 import utils
 
+# 导入数据库相关
+from database import get_alert_repository
+from auth_manager import get_auth_manager
+
 # 全局变量存储最新温度数据
 latest_temperature = None
 last_temperature_time = 0
@@ -129,6 +133,7 @@ class VideoThread(QThread):
     update_frame = pyqtSignal(np.ndarray, list)
     update_fps = pyqtSignal(float)
     update_status = pyqtSignal(str, str)  # 添加状态更新信号
+    detection_finished = pyqtSignal()  # 检测完成信号（图片或视频结束）
     
     def __init__(self, source=0, model_path='yolov8n.pt', conf=0.25):
         super().__init__()
@@ -206,9 +211,13 @@ class VideoThread(QThread):
                     fps_timer = cv2.getTickCount()
                     
             cap.release()
+            # 视频播放完成，发送检测完成信号
+            if not self.use_camera:
+                self.detection_finished.emit()
             
         except Exception as e:
             self.update_status.emit(f"错误: {str(e)}", "#EA4335")  # 红色
+            self.detection_finished.emit()
         
     def process_image(self, model):
         """处理单张图片"""
@@ -230,9 +239,12 @@ class VideoThread(QThread):
             
             # 完成状态
             self.update_status.emit("图片检测完成", "#4CAF50")  # 绿色
+            # 发送检测完成信号
+            self.detection_finished.emit()
             
         except Exception as e:
             self.update_status.emit(f"图片处理错误: {str(e)}", "#EA4335")  # 红色
+            self.detection_finished.emit()
         
     def stop(self):
         self.running = False
@@ -272,9 +284,14 @@ class YOLODetectorGUI(QMainWindow):
         self.video_thread = None
         self.detection_running = False
         self.last_detection_counts = {}
-        self.save_detection_results = False  # 是否保存检测结果
         self.current_input_file = ""  # 当前输入文件路径
         self.temperature_server = None  # 温度数据服务器
+        self.current_temperature_alert = None  # 当前温度报警状态
+        
+        # 报警去重控制（用于视频/摄像头实时检测）
+        self.last_alert_states = {}  # 上次报警状态 {alert_key: {'level': int, 'time': timestamp}}
+        self.alert_cooldown_seconds = 60  # 报警冷却时间（秒）
+        self.is_realtime_detection = False  # 是否为实时检测（视频/摄像头）
         
         # 创建界面
         self.init_ui()
@@ -374,7 +391,29 @@ class YOLODetectorGUI(QMainWindow):
         show_stats_action.triggered.connect(self.toggle_stats_view)
         view_menu.addAction(show_stats_action)
         
-
+        view_menu.addSeparator()
+        
+        # 报警记录查看
+        view_alerts_action = QAction("📋 查看报警记录", self)
+        view_alerts_action.triggered.connect(self.open_alert_view_window)
+        view_menu.addAction(view_alerts_action)
+        
+    def open_alert_view_window(self):
+        """打开报警查看窗口"""
+        try:
+            from alert_view_window import AlertViewWindow
+            
+            # 创建并显示报警查看窗口
+            self.alert_view_window = AlertViewWindow(self)
+            self.alert_view_window.setWindowModality(Qt.NonModal)  # 非模态窗口
+            self.alert_view_window.show()
+            self.alert_view_window.raise_()
+            self.alert_view_window.activateWindow()
+            
+            self.log_info("已打开报警记录查看窗口")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开报警查看窗口失败: {str(e)}")
+            self.log_info(f"打开报警查看窗口失败: {str(e)}")
         
     def create_left_panel(self):
         # 创建左侧控制面板
@@ -443,11 +482,28 @@ class YOLODetectorGUI(QMainWindow):
         self.conf_label = QLabel(f"置信度: {self.confidence:.2f}")
         model_layout.addRow(self.conf_label, self.conf_slider)
         
-        # 添加保存检测结果选项
-        self.save_results_checkbox = QCheckBox("保存检测结果")
-        self.save_results_checkbox.setChecked(self.save_detection_results)
-        self.save_results_checkbox.stateChanged.connect(self.toggle_save_results)
-        model_layout.addRow("保存选项:", self.save_results_checkbox)
+        # 生产人员安全检测选项
+        safety_group = QGroupBox("生产人员安全检测")
+        safety_layout = QVBoxLayout(safety_group)
+        safety_layout.setSpacing(5)
+        safety_layout.setContentsMargins(10, 10, 10, 10)
+        
+        self.helmet_checkbox = QCheckBox("安全帽")
+        self.helmet_checkbox.setChecked(True)
+        self.helmet_checkbox.setStyleSheet("font-size: 11px;")
+        safety_layout.addWidget(self.helmet_checkbox)
+        
+        self.vest_checkbox = QCheckBox("反光背心")
+        self.vest_checkbox.setChecked(True)
+        self.vest_checkbox.setStyleSheet("font-size: 11px;")
+        safety_layout.addWidget(self.vest_checkbox)
+        
+        self.glove_checkbox = QCheckBox("手套")
+        self.glove_checkbox.setChecked(False)
+        self.glove_checkbox.setStyleSheet("font-size: 11px;")
+        safety_layout.addWidget(self.glove_checkbox)
+        
+        model_layout.addRow(safety_group)
         
         # 检测控制组
         control_group = QGroupBox("检测控制")
@@ -508,26 +564,50 @@ class YOLODetectorGUI(QMainWindow):
         self.stats_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         stats_layout.addWidget(self.stats_table)
         
-        # 检测结果告知栏
+        # 安全警报区域 - 合并显示生产环境和人员安全警报
         alert_group = QGroupBox("安全警报")
         alert_layout = QVBoxLayout(alert_group)
+        alert_layout.setSpacing(8)
         
-        self.alert_label = QLabel("未检测到危险")
-        self.alert_label.setAlignment(Qt.AlignCenter)
-        self.alert_label.setWordWrap(True)
-        self.alert_label.setMinimumHeight(60)
-        self.alert_label.setStyleSheet("""
-            QLabel {
+        # 环境安全警报标签
+        env_alert_label = QLabel("生产环境：")
+        env_alert_label.setStyleSheet("font-weight: bold; font-size: 11px; color: #333;")
+        alert_layout.addWidget(env_alert_label)
+        
+        self.env_alert_text = QTextEdit()
+        self.env_alert_text.setReadOnly(True)
+        self.env_alert_text.setMaximumHeight(70)
+        self.env_alert_text.setStyleSheet("""
+            QTextEdit {
                 border: 2px solid #4CAF50;
-                border-radius: 8px;
+                border-radius: 6px;
                 background-color: #E8F5E9;
                 color: #2E7D32;
-                font-size: 14px;
-                font-weight: bold;
-                padding: 10px;
+                font-size: 11px;
+                padding: 5px;
             }
         """)
-        alert_layout.addWidget(self.alert_label)
+        alert_layout.addWidget(self.env_alert_text)
+        
+        # 人员安全警报标签
+        person_alert_label = QLabel("生产人员：")
+        person_alert_label.setStyleSheet("font-weight: bold; font-size: 11px; color: #333;")
+        alert_layout.addWidget(person_alert_label)
+        
+        self.person_alert_text = QTextEdit()
+        self.person_alert_text.setReadOnly(True)
+        self.person_alert_text.setMaximumHeight(50)
+        self.person_alert_text.setStyleSheet("""
+            QTextEdit {
+                border: 2px solid #4CAF50;
+                border-radius: 6px;
+                background-color: #E8F5E9;
+                color: #2E7D32;
+                font-size: 11px;
+                padding: 5px;
+            }
+        """)
+        alert_layout.addWidget(self.person_alert_text)
         
         # 温度显示组
         temp_group = QGroupBox("区域温度")
@@ -930,9 +1010,13 @@ class YOLODetectorGUI(QMainWindow):
             
     def start_detection(self):
         """开始检测"""
+        # 如果检测正在进行中，先停止当前检测
         if self.detection_running:
-            self.log_info("检测已在进行中")
-            return
+            self.log_info("检测已在进行中，先停止当前检测...")
+            self.stop_detection()
+            # 等待线程完全结束
+            if self.video_thread:
+                self.video_thread.wait(1000)  # 最多等待1秒
             
         # 根据选择的输入源设置
         source_index = self.source_combo.currentIndex()
@@ -1010,6 +1094,15 @@ class YOLODetectorGUI(QMainWindow):
             self.clear_detection_stats()
             self.detection_running = True
             
+            # 判断是否为实时检测（视频或摄像头），用于报警去重控制
+            # 图片检测时清空报警状态记录，视频/摄像头启用防重复机制
+            self.is_realtime_detection = (source_index == 0) or (source_index == 1)
+            if not self.is_realtime_detection:
+                self.last_alert_states = {}
+                self.log_info("图片检测模式：报警防重复机制已禁用")
+            else:
+                self.log_info("实时检测模式：报警防重复机制已启用（冷却期60秒）")
+            
             # 禁用控制按钮
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
@@ -1036,6 +1129,7 @@ class YOLODetectorGUI(QMainWindow):
         self.video_thread.update_frame.connect(self.update_display)
         self.video_thread.update_fps.connect(self.update_fps)
         self.video_thread.update_status.connect(self.set_status)  # 连接状态更新信号
+        self.video_thread.detection_finished.connect(self.on_detection_finished)  # 检测完成信号
                     
     def stop_detection(self):
         """停止检测"""
@@ -1043,6 +1137,15 @@ class YOLODetectorGUI(QMainWindow):
             self.log_info("停止检测")
             self.video_thread.stop()
             
+        self._reset_detection_state()
+    
+    def on_detection_finished(self):
+        """检测完成回调（图片处理完成或视频播放结束）"""
+        self.log_info("检测完成，自动重置状态")
+        self._reset_detection_state()
+    
+    def _reset_detection_state(self):
+        """重置检测状态"""
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.detection_running = False
@@ -1063,10 +1166,6 @@ class YOLODetectorGUI(QMainWindow):
             
             # 更新检测统计
             self.update_detection_stats(results)
-            
-            # 如果启用了保存功能，保存处理后的图像
-            if self.save_detection_results:
-                self.save_detection_image(processed_img)
         else:
             processed_img = frame
             
@@ -1080,26 +1179,6 @@ class YOLODetectorGUI(QMainWindow):
         # 显示图像
         self.display_image(pixmap)
         
-    def save_detection_image(self, image):
-        """保存处理后的检测图像"""
-        try:
-            # 创建results目录（如果不存在）
-            save_dir = os.path.join(os.getcwd(), "results")
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-                
-            # 生成文件名（使用时间戳）
-            timestamp = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
-            filename = f"detection_{timestamp}.jpg"
-            save_path = os.path.join(save_dir, filename)
-            
-            # 保存图像
-            cv2.imwrite(save_path, image)
-            self.log_info(f"已保存检测结果: {save_path}")
-            
-        except Exception as e:
-            self.log_info(f"保存检测结果出错: {str(e)}")
-            
     def update_detection_stats(self, results):
         """更新检测统计信息"""
         try:
@@ -1137,104 +1216,424 @@ class YOLODetectorGUI(QMainWindow):
             # 保存当前统计结果
             self.last_detection_counts = current_counts
             
-            # 更新安全警报
-            self.update_alert(current_counts)
+            # 更新安全警报（传递当前温度报警状态）
+            self.update_alert(current_counts, self.current_temperature_alert)
             
         except Exception as e:
             self.log_info(f"更新统计信息出错: {str(e)}")
             
-    def update_alert(self, current_counts):
-        """根据检测结果更新安全警报显示"""
+    def update_alert(self, current_counts, temperature_alert=None):
+        """
+        根据检测结果更新安全警报显示
+        
+        Args:
+            current_counts: 检测到的目标类别和数量
+            temperature_alert: 温度报警信息，格式为 {'level': 1/2/3, 'message': '...'}
+        """
         try:
             # 获取检测到的类别（转换为小写以便匹配）
             detected_classes = set()
-            for cls_name in current_counts.keys():
-                detected_classes.add(cls_name.lower())
+            class_counts = {}
+            for cls_name, count in current_counts.items():
+                cls_lower = cls_name.lower()
+                detected_classes.add(cls_lower)
+                class_counts[cls_lower] = count
             
-            # 判断危险等级
+            # 生产环境安全警报
+            env_alerts = []
+            env_max_level = 0  # 0=安全, 1=低, 2=中, 3=高
+            
+            # 火警检测（fire和smoke）
             has_fire = "fire" in detected_classes
             has_smoke = "smoke" in detected_classes
             
             if has_fire and has_smoke:
-                # 最高级别：同时检测到火焰和烟雾
-                alert_text = "⚠️ 警告！检测到火焰和烟雾！\n请立即采取紧急措施！"
-                alert_style = """
-                    QLabel {
-                        border: 3px solid #D32F2F;
-                        border-radius: 8px;
-                        background-color: #FFEBEE;
-                        color: #B71C1C;
-                        font-size: 14px;
-                        font-weight: bold;
-                        padding: 10px;
-                    }
-                """
+                env_alerts.append(f"🔥⚠️ 火警三级（最高）：检测到明火和烟雾，数量：火={class_counts.get('fire', 0)}, 烟={class_counts.get('smoke', 0)}")
+                env_max_level = max(env_max_level, 3)
             elif has_fire:
-                # 高级别：检测到火焰
-                alert_text = "🔥 警告！检测到火焰！\n请立即处理！"
-                alert_style = """
-                    QLabel {
-                        border: 3px solid #F57C00;
-                        border-radius: 8px;
-                        background-color: #FFF3E0;
-                        color: #E65100;
-                        font-size: 14px;
-                        font-weight: bold;
-                        padding: 10px;
-                    }
-                """
+                env_alerts.append(f"🔥 火警二级：检测到明火，数量：{class_counts.get('fire', 0)}")
+                env_max_level = max(env_max_level, 2)
             elif has_smoke:
-                # 中级别：检测到烟雾
-                alert_text = "💨 注意！检测到烟雾！\n请密切关注！"
-                alert_style = """
-                    QLabel {
-                        border: 3px solid #FBC02D;
-                        border-radius: 8px;
-                        background-color: #FFFDE7;
-                        color: #F57F17;
-                        font-size: 14px;
-                        font-weight: bold;
-                        padding: 10px;
-                    }
-                """
-            else:
-                # 安全状态
-                alert_text = "✅ 未检测到危险\n环境安全"
-                alert_style = """
-                    QLabel {
-                        border: 2px solid #4CAF50;
-                        border-radius: 8px;
-                        background-color: #E8F5E9;
-                        color: #2E7D32;
-                        font-size: 14px;
-                        font-weight: bold;
-                        padding: 10px;
-                    }
-                """
+                env_alerts.append(f"💨 火警一级：检测到烟雾，数量：{class_counts.get('smoke', 0)}")
+                env_max_level = max(env_max_level, 1)
             
-            self.alert_label.setText(alert_text)
-            self.alert_label.setStyleSheet(alert_style)
+            # 高温报警（从温度数据获取）
+            if temperature_alert:
+                temp_level = temperature_alert.get('level', 0)
+                temp_msg = temperature_alert.get('message', '')
+                if temp_level == 3:
+                    env_alerts.append(f"🌡️⚠️ 高温三级（最高）：{temp_msg}")
+                    env_max_level = max(env_max_level, 3)
+                elif temp_level == 2:
+                    env_alerts.append(f"🌡️ 高温二级：{temp_msg}")
+                    env_max_level = max(env_max_level, 2)
+                elif temp_level == 1:
+                    env_alerts.append(f"🌡️ 高温一级：{temp_msg}")
+                    env_max_level = max(env_max_level, 1)
+            
+            # 设置环境安全警报显示
+            if env_alerts:
+                env_text = "\n".join(env_alerts)
+                env_style = self._get_alert_style(env_max_level)
+            else:
+                env_text = "✅ 生产环境安全"
+                env_style = self._get_alert_style(0)
+            
+            self.env_alert_text.setText(env_text)
+            self.env_alert_text.setStyleSheet(env_style)
+            
+            # 生产人员安全警报
+            person_alerts = []
+            person_alert_level = 0  # 0=正常, 1=警告
+            
+            # 获取勾选的检测项
+            check_helmet = self.helmet_checkbox.isChecked()
+            check_vest = self.vest_checkbox.isChecked()
+            check_glove = self.glove_checkbox.isChecked()
+            
+            # 获取检测到的数量
+            person_count = class_counts.get('person', 0)
+            helmet_count = class_counts.get('helmet', 0)
+            vest_count = class_counts.get('vest', 0)
+            glove_count = class_counts.get('glove', 0)
+            
+            # 只有当检测到人员时才进行安全检测
+            if person_count > 0:
+                # 检查安全帽
+                if check_helmet:
+                    if helmet_count < person_count:
+                        missing_helmet = person_count - helmet_count
+                        person_alerts.append(f"⚠️ {missing_helmet}人未佩戴安全帽")
+                        person_alert_level = max(person_alert_level, 1)
+                    else:
+                        person_alerts.append(f"✅ 安全帽：{helmet_count}人佩戴")
+                
+                # 检查反光背心
+                if check_vest:
+                    if vest_count < person_count:
+                        missing_vest = person_count - vest_count
+                        person_alerts.append(f"⚠️ {missing_vest}人未穿戴反光背心")
+                        person_alert_level = max(person_alert_level, 1)
+                    else:
+                        person_alerts.append(f"✅ 反光背心：{vest_count}人穿戴")
+                
+                # 检查手套
+                if check_glove:
+                    if glove_count < person_count:
+                        missing_glove = person_count - glove_count
+                        person_alerts.append(f"⚠️ {missing_glove}人未佩戴手套")
+                        person_alert_level = max(person_alert_level, 1)
+                    else:
+                        person_alerts.append(f"✅ 手套：{glove_count}人佩戴")
+                
+                # 如果没有勾选任何检测项
+                if not (check_helmet or check_vest or check_glove):
+                    person_alerts.append(f"ℹ️ 检测到{person_count}人（未启用安全检测）")
+            else:
+                person_alerts.append("ℹ️ 未检测到人员")
+            
+            # 设置人员安全警报显示
+            if person_alerts:
+                person_text = "\n".join(person_alerts)
+                person_style = self._get_person_alert_style(person_alert_level)
+            else:
+                person_text = "ℹ️ 未检测到人员"
+                person_style = self._get_person_alert_style(0)
+            
+            self.person_alert_text.setText(person_text)
+            self.person_alert_text.setStyleSheet(person_style)
+            
+            # 保存报警信息到数据库（如果有报警）
+            if env_max_level > 0 or person_alert_level > 0:
+                self._save_alerts_to_database(env_alerts, person_alerts, class_counts, temperature_alert)
             
         except Exception as e:
             self.log_info(f"更新警报出错: {str(e)}")
+    
+    def _get_person_alert_style(self, level):
+        """根据人员安全警报级别返回样式"""
+        styles = {
+            0: """
+                QTextEdit {
+                    border: 2px solid #4CAF50;
+                    border-radius: 6px;
+                    background-color: #E8F5E9;
+                    color: #2E7D32;
+                    font-size: 11px;
+                    padding: 5px;
+                }
+            """,
+            1: """
+                QTextEdit {
+                    border: 2px solid #F57C00;
+                    border-radius: 6px;
+                    background-color: #FFF3E0;
+                    color: #E65100;
+                    font-size: 11px;
+                    padding: 5px;
+                }
+            """
+        }
+        return styles.get(level, styles[0])
+    
+    def _get_alert_style(self, level):
+        """根据警报级别返回样式"""
+        styles = {
+            0: """
+                QTextEdit {
+                    border: 2px solid #4CAF50;
+                    border-radius: 6px;
+                    background-color: #E8F5E9;
+                    color: #2E7D32;
+                    font-size: 11px;
+                    padding: 5px;
+                }
+            """,
+            1: """
+                QTextEdit {
+                    border: 2px solid #FBC02D;
+                    border-radius: 6px;
+                    background-color: #FFFDE7;
+                    color: #F57F17;
+                    font-size: 11px;
+                    padding: 5px;
+                }
+            """,
+            2: """
+                QTextEdit {
+                    border: 2px solid #F57C00;
+                    border-radius: 6px;
+                    background-color: #FFF3E0;
+                    color: #E65100;
+                    font-size: 11px;
+                    padding: 5px;
+                }
+            """,
+            3: """
+                QTextEdit {
+                    border: 2px solid #D32F2F;
+                    border-radius: 6px;
+                    background-color: #FFEBEE;
+                    color: #B71C1C;
+                    font-size: 11px;
+                    padding: 5px;
+                }
+            """
+        }
+        return styles.get(level, styles[0])
+    
+    def _should_save_alert(self, alert_key, alert_level):
+        """
+        判断是否应保存报警（防重复逻辑）
+        
+        规则：
+        1. 图片检测：不受限制，每次都保存
+        2. 实时检测（视频/摄像头）：
+           - 报警级别升高（如1级→2级、2级→3级）：立即保存，不受时间限制
+           - 报警级别不变或降低：需要间隔60秒才保存
+           - 首次出现该类型报警：立即保存
+        
+        Args:
+            alert_key: 报警类型标识（如 'fire', 'helmet' 等）
+            alert_level: 报警级别
+            
+        Returns:
+            bool: 是否应该保存报警
+        """
+        # 非实时检测（图片），直接保存
+        if not self.is_realtime_detection:
+            return True
+        
+        current_time = time.time()
+        
+        # 检查该类型报警的上次状态
+        if alert_key in self.last_alert_states:
+            last_state = self.last_alert_states[alert_key]
+            last_level = last_state['level']
+            last_time = last_state['time']
+            
+            # 报警级别升高，立即保存（如1级→2级、2级→3级）
+            if alert_level > last_level:
+                self.log_info(f"[{alert_key}] 报警级别升高 ({last_level}级→{alert_level}级)，立即保存")
+                self.last_alert_states[alert_key] = {'level': alert_level, 'time': current_time}
+                return True
+            
+            # 报警级别不变或降低，检查冷却时间
+            elapsed = current_time - last_time
+            if elapsed < self.alert_cooldown_seconds:
+                # 冷却时间内，不保存
+                action = "保持不变" if alert_level == last_level else "降低"
+                self.log_info(f"[{alert_key}] 报警级别{action} ({last_level}级→{alert_level}级)，冷却中还需 {int(self.alert_cooldown_seconds - elapsed)} 秒")
+                return False
+            
+            # 冷却时间已过，更新状态并保存
+            self.last_alert_states[alert_key] = {'level': alert_level, 'time': current_time}
+            return True
+        else:
+            # 首次出现该类型报警，保存并记录状态
+            self.last_alert_states[alert_key] = {'level': alert_level, 'time': current_time}
+            return True
+    
+    def _save_alerts_to_database(self, env_alerts, person_alerts, class_counts, temperature_alert):
+        """
+        保存报警信息到数据库
+        
+        Args:
+            env_alerts: 环境安全警报列表
+            person_alerts: 人员安全警报列表
+            class_counts: 检测到的类别数量
+            temperature_alert: 温度报警信息
+        """
+        try:
+            alert_repo = get_alert_repository()
+            auth_manager = get_auth_manager()
+            
+            # 获取当前用户信息
+            current_user = auth_manager.current_user
+            resolved_by = current_user.get('username') if current_user else 'system'
+            
+            # 保存环境安全报警
+            detected_objects = {
+                'fire': class_counts.get('fire', 0),
+                'smoke': class_counts.get('smoke', 0),
+                'person': class_counts.get('person', 0),
+                'helmet': class_counts.get('helmet', 0),
+                'vest': class_counts.get('vest', 0),
+                'glove': class_counts.get('glove', 0)
+            }
+            
+            # 火警报警
+            if class_counts.get('fire', 0) > 0 or class_counts.get('smoke', 0) > 0:
+                fire_level = 0
+                if class_counts.get('fire', 0) > 0 and class_counts.get('smoke', 0) > 0:
+                    fire_level = 3
+                elif class_counts.get('fire', 0) > 0:
+                    fire_level = 2
+                elif class_counts.get('smoke', 0) > 0:
+                    fire_level = 1
+                
+                # 检查是否应该保存（防重复）
+                if self._should_save_alert('fire', fire_level):
+                    fire_message = "; ".join([alert for alert in env_alerts if '火警' in alert])
+                    
+                    result = alert_repo.create_alert(
+                        alert_type='fire',
+                        alert_category='environment',
+                        alert_level=fire_level,
+                        alert_message=fire_message,
+                        detected_objects=detected_objects,
+                        temperature_data=temperature_alert
+                    )
+                    if result['success']:
+                        self.log_info(f"火警报警已保存到数据库，ID: {result.get('alert_id')}")
+                else:
+                    self.log_info("火警报警处于冷却期，跳过保存")
+            
+            # 高温报警
+            if temperature_alert and temperature_alert.get('level', 0) > 0:
+                temp_level = temperature_alert.get('level', 1)
+                
+                # 检查是否应该保存（防重复）
+                if self._should_save_alert('temperature', temp_level):
+                    result = alert_repo.create_alert(
+                        alert_type='temperature',
+                        alert_category='environment',
+                        alert_level=temp_level,
+                        alert_message=temperature_alert.get('message', '温度异常'),
+                        detected_objects=detected_objects,
+                        temperature_data=temperature_alert
+                    )
+                    if result['success']:
+                        self.log_info(f"高温报警已保存到数据库，ID: {result.get('alert_id')}")
+                else:
+                    self.log_info("高温报警处于冷却期，跳过保存")
+            
+            # 人员安全报警 - 根据勾选和检测数量判断是否报警
+            person_count = class_counts.get('person', 0)
+            helmet_count = class_counts.get('helmet', 0)
+            vest_count = class_counts.get('vest', 0)
+            glove_count = class_counts.get('glove', 0)
+            
+            # 获取勾选的检测项
+            check_helmet = self.helmet_checkbox.isChecked()
+            check_vest = self.vest_checkbox.isChecked()
+            check_glove = self.glove_checkbox.isChecked()
+            
+            # 只有当检测到人员且勾选了检测项时才保存报警
+            if person_count > 0:
+                # 安全帽报警
+                if check_helmet and helmet_count < person_count:
+                    # 检查是否应该保存（防重复）
+                    if self._should_save_alert('helmet', 1):
+                        missing = person_count - helmet_count
+                        result = alert_repo.create_alert(
+                            alert_type='helmet',
+                            alert_category='personnel',
+                            alert_level=1,
+                            alert_message=f"{missing}人未佩戴安全帽（共{person_count}人）",
+                            detected_objects=detected_objects
+                        )
+                        if result['success']:
+                            self.log_info(f"安全帽报警已保存到数据库，ID: {result.get('alert_id')}")
+                    else:
+                        self.log_info("安全帽报警处于冷却期，跳过保存")
+                
+                # 反光背心报警
+                if check_vest and vest_count < person_count:
+                    # 检查是否应该保存（防重复）
+                    if self._should_save_alert('vest', 1):
+                        missing = person_count - vest_count
+                        result = alert_repo.create_alert(
+                            alert_type='vest',
+                            alert_category='personnel',
+                            alert_level=1,
+                            alert_message=f"{missing}人未穿戴反光背心（共{person_count}人）",
+                            detected_objects=detected_objects
+                        )
+                        if result['success']:
+                            self.log_info(f"反光背心报警已保存到数据库，ID: {result.get('alert_id')}")
+                    else:
+                        self.log_info("反光背心报警处于冷却期，跳过保存")
+                
+                # 手套报警
+                if check_glove and glove_count < person_count:
+                    # 检查是否应该保存（防重复）
+                    if self._should_save_alert('glove', 1):
+                        missing = person_count - glove_count
+                        result = alert_repo.create_alert(
+                            alert_type='glove',
+                            alert_category='personnel',
+                            alert_level=1,
+                            alert_message=f"{missing}人未佩戴手套（共{person_count}人）",
+                            detected_objects=detected_objects
+                        )
+                        if result['success']:
+                            self.log_info(f"手套报警已保存到数据库，ID: {result.get('alert_id')}")
+                    else:
+                        self.log_info("手套报警处于冷却期，跳过保存")
+                    
+        except Exception as e:
+            self.log_info(f"保存报警到数据库失败: {str(e)}")
             
     def clear_detection_stats(self):
         """清空检测统计"""
         self.last_detection_counts = {}
         self.stats_table.setRowCount(0)
-        # 重置警报为安全状态
-        self.alert_label.setText("✅ 未检测到危险\n环境安全")
-        self.alert_label.setStyleSheet("""
-            QLabel {
+        # 重置环境安全警报为安全状态
+        self.env_alert_text.setText("✅ 生产环境安全")
+        self.env_alert_text.setStyleSheet("""
+            QTextEdit {
                 border: 2px solid #4CAF50;
-                border-radius: 8px;
+                border-radius: 6px;
                 background-color: #E8F5E9;
                 color: #2E7D32;
-                font-size: 14px;
-                font-weight: bold;
-                padding: 10px;
+                font-size: 11px;
+                padding: 5px;
             }
         """)
+        # 重置人员安全警报
+        self.person_alert_text.setText("ℹ️ 未检测到人员")
+        self.person_alert_text.setStyleSheet(self._get_person_alert_style(0))
             
     def update_fps(self, fps):
         """更新FPS显示"""
@@ -1314,21 +1713,33 @@ class YOLODetectorGUI(QMainWindow):
                 temp_value = latest_temperature['value']
                 sensor_id = latest_temperature['sensorId']
                 
-                # 根据温度值设置不同颜色
+                # 根据温度值设置不同颜色和报警级别
                 if temp_value > 50:
-                    # 高温警告
+                    # 高温警告 - 三级
                     border_color = "#D32F2F"
                     bg_color = "#FFEBEE"
                     text_color = "#B71C1C"
                     status_text = "⚠️ 温度过高！"
                     status_color = "#D32F2F"
+                    self.current_temperature_alert = {
+                        'level': 3,
+                        'message': f'温度{temp_value:.1f}°C超过50°C',
+                        'value': temp_value,
+                        'sensor_id': sensor_id
+                    }
                 elif temp_value > 30:
-                    # 中等温度
+                    # 中等温度 - 二级
                     border_color = "#FF9800"
                     bg_color = "#FFF3E0"
                     text_color = "#E65100"
                     status_text = "温度偏高"
                     status_color = "#FF9800"
+                    self.current_temperature_alert = {
+                        'level': 2,
+                        'message': f'温度{temp_value:.1f}°C超过30°C',
+                        'value': temp_value,
+                        'sensor_id': sensor_id
+                    }
                 else:
                     # 正常温度
                     border_color = "#4CAF50"
@@ -1336,6 +1747,7 @@ class YOLODetectorGUI(QMainWindow):
                     text_color = "#2E7D32"
                     status_text = "温度正常"
                     status_color = "#4CAF50"
+                    self.current_temperature_alert = None
                 
                 self.temp_label.setText(f"🌡️ {temp_value:.1f}°C")
                 self.temp_label.setStyleSheet(f"""
@@ -1378,11 +1790,6 @@ class YOLODetectorGUI(QMainWindow):
             self.temp_timer.stop()
         
         event.accept()
-
-    def toggle_save_results(self, state):
-        """切换是否保存检测结果"""
-        self.save_detection_results = bool(state)
-        self.log_info(f"{'启用' if self.save_detection_results else '禁用'}检测结果保存")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
